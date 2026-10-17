@@ -1,0 +1,47 @@
+.app-shell {
+  min-height: 100vh;
+  background: linear-gradient(180deg, #f4fbff 0%, #eff6ff 100%);
+}
+
+.panel {
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 1.25rem;
+  box-shadow: 0 22px 55px rgba(15, 23, 42, 0.08);
+}
+
+.grid-pattern {
+  background-image: radial-gradient(circle at 1px 1px, rgba(148, 163, 184, 0.18) 1px, transparent 0);
+  background-size: 20px 20px;
+}
+
+.timer-ring {
+  border: 10px solid rgba(20, 184, 166, 0.12);
+  border-top-color: #14b8a6;
+  border-radius: 9999px;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+}
+
+.exam-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+video {
+  width: 100%;
+  max-height: 340px;
+  object-fit: cover;
+  border-radius: 1rem;
+  background: #0f172a;
+}
