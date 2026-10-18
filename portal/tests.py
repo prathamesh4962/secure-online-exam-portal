@@ -1,4 +1,5 @@
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
@@ -210,6 +211,9 @@ class CombinedWarningTests(TestCase):
             self.assertEqual(response.status_code, 201)
             self.assertEqual(response.json()['warning_count'], index)
             self.assertEqual(response.json()['auto_submitted'], index == 3)
+            if index == 3:
+                self.assertIsNotNone(response.json()['submitted_at'])
+                self.assertEqual(response.json()['score'], 5)
 
         attempt = ExamAttempt.objects.get(pk=self.attempt_id)
         self.assertEqual(attempt.status, ExamAttempt.STATUS_SUBMITTED)
@@ -249,3 +253,88 @@ class CombinedWarningTests(TestCase):
         self.assertEqual(first.json()['warning_count'], 1)
         self.assertEqual(second.json()['warning_count'], 2)
         self.assertEqual(ExamAttempt.objects.get(pk=self.attempt_id).status, ExamAttempt.STATUS_IN_PROGRESS)
+
+    def test_attempt_state_returns_server_calculated_remaining_time(self):
+        attempt = ExamAttempt.objects.get(pk=self.attempt_id)
+        attempt.started_at = timezone.now() - timedelta(minutes=5)
+        attempt.save(update_fields=['started_at'])
+
+        response = self.client.get(f'/api/exams/{self.exam.id}/attempt/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreater(response.json()['time_remaining_seconds'], 23 * 60)
+        self.assertLessEqual(response.json()['time_remaining_seconds'], 25 * 60)
+
+    def test_attempt_timer_does_not_round_down_before_deadline(self):
+        attempt = ExamAttempt.objects.get(pk=self.attempt_id)
+        attempt.started_at = timezone.now() - timedelta(minutes=self.exam.duration_minutes) + timedelta(seconds=30)
+        attempt.save(update_fields=['started_at'])
+
+        response = self.client.get(f'/api/exams/{self.exam.id}/attempt/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(response.json()['time_remaining_seconds'], 30)
+
+    def test_expired_attempt_is_submitted_and_cannot_save_answers(self):
+        attempt = ExamAttempt.objects.get(pk=self.attempt_id)
+        attempt.started_at = timezone.now() - timedelta(minutes=31)
+        attempt.save(update_fields=['started_at'])
+
+        submit_response = self.client.post(
+            f'/api/attempts/{attempt.id}/submit/',
+            {
+                'reason': ExamAttempt.SUBMISSION_MANUAL,
+                'answers': [{'question_id': self.question.id, 'option_id': self.option.id}],
+            },
+            content_type='application/json',
+        )
+        answer_response = self.client.post(
+            f'/api/attempts/{attempt.id}/save-answer/',
+            {'question_id': self.question.id, 'option_id': self.option.id},
+            content_type='application/json',
+        )
+        state_response = self.client.get(f'/api/exams/{self.exam.id}/attempt/')
+        attempt.refresh_from_db()
+
+        self.assertEqual(submit_response.status_code, 200)
+        self.assertEqual(submit_response.json()['submission_reason'], ExamAttempt.SUBMISSION_TIME_EXPIRED)
+        self.assertEqual(state_response.status_code, 200)
+        self.assertEqual(state_response.json()['status'], ExamAttempt.STATUS_SUBMITTED)
+        self.assertEqual(state_response.json()['submission_reason'], ExamAttempt.SUBMISSION_TIME_EXPIRED)
+        self.assertEqual(state_response.json()['time_remaining_seconds'], 0)
+        self.assertIsNotNone(state_response.json()['submitted_at'])
+        self.assertEqual(answer_response.status_code, 400)
+        self.assertEqual(attempt.status, ExamAttempt.STATUS_SUBMITTED)
+        self.assertFalse(attempt.answers.exists())
+        self.assertEqual(AuditLog.objects.filter(action='submit_exam', target_id=str(attempt.id)).count(), 1)
+
+    def test_client_cannot_submit_as_time_expired_before_deadline(self):
+        response = self.client.post(
+            f'/api/attempts/{self.attempt_id}/submit/',
+            {'reason': ExamAttempt.SUBMISSION_TIME_EXPIRED},
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(ExamAttempt.objects.get(pk=self.attempt_id).status, ExamAttempt.STATUS_IN_PROGRESS)
+
+    @patch('portal.views.analyze_frame', return_value={
+        'face_detected': False,
+        'face_confidence': 0,
+        'status': 'warning',
+        'detail': 'No face detected.',
+    })
+    def test_frame_analysis_does_not_create_repeated_incidents(self, analyze_frame):
+        payload = {
+            'exam_id': self.exam.id,
+            'attempt_id': self.attempt_id,
+            'image': 'data:image/jpeg;base64,ZmFrZQ==',
+        }
+
+        first = self.client.post('/api/proctoring/analyze/', payload, content_type='application/json')
+        second = self.client.post('/api/proctoring/analyze/', payload, content_type='application/json')
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(analyze_frame.call_count, 2)
+        self.assertFalse(Incident.objects.filter(attempt_id=self.attempt_id).exists())

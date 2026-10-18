@@ -425,6 +425,7 @@ function LandingPage({ user }) {
 function AuthPage({ user, onLogin, onRegister }) {
   const [mode, setMode] = useState('login')
   const [form, setForm] = useState({ username: '', email: '', password: '' })
+  const [authError, setAuthError] = useState('')
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -433,6 +434,7 @@ function AuthPage({ user, onLogin, onRegister }) {
 
   const handleSubmit = async (event) => {
     event.preventDefault()
+    setAuthError('')
     const payload = { username: form.username, password: form.password }
     if (mode === 'register') payload.email = form.email
 
@@ -441,7 +443,10 @@ function AuthPage({ user, onLogin, onRegister }) {
       else await onRegister(payload)
       navigate('/dashboard')
     } catch (error) {
-      alert(error.response?.data?.detail || 'Authentication failed.')
+      const contentType = error.response?.headers?.['content-type'] || ''
+      setAuthError(!error.response || contentType.includes('text/html')
+        ? 'The exam API is not connected yet. Please try again after backend deployment is complete.'
+        : error.response?.data?.detail || 'Authentication failed.')
     }
   }
 
@@ -494,6 +499,12 @@ function AuthPage({ user, onLogin, onRegister }) {
             </div>
 
             {mode === 'register' && <p className="text-sm text-slate-500">New accounts are registered as students. Faculty and administrator accounts are created by an administrator.</p>}
+
+            {authError && (
+              <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+                {authError}
+              </p>
+            )}
 
             <button type="submit" className="w-full rounded-xl bg-slate-950 px-4 py-3 font-semibold text-white hover:bg-slate-800">
               {mode === 'login' ? 'Login to portal' : 'Create account'}
@@ -1033,12 +1044,19 @@ function ExamRoomPage({ exams }) {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(false)
+  const [finalWarningPending, setFinalWarningPending] = useState(false)
+  const [submittedAt, setSubmittedAt] = useState(null)
+  const [submittedScore, setSubmittedScore] = useState(null)
+  const [submissionReason, setSubmissionReason] = useState('')
   const [monitoringActive, setMonitoringActive] = useState(false)
   const [examMessage, setExamMessage] = useState('')
+  const [warningNotice, setWarningNotice] = useState('')
+  const finalWarningPendingRef = useRef(false)
   const [cameraStatus, setCameraStatus] = useState('checking')
   const [microphoneStatus, setMicrophoneStatus] = useState('not connected')
   const [faceStatus, setFaceStatus] = useState('Checking face presence...')
   const [warningCount, setWarningCount] = useState(0)
+  const warningCountRef = useRef(0)
   const [timeLeft, setTimeLeft] = useState((exam?.duration_minutes ?? 0) * 60)
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [selectedOption, setSelectedOption] = useState({})
@@ -1070,12 +1088,15 @@ function ExamRoomPage({ exams }) {
     API.get(`/exams/${exam.id}/attempt/`).then(({ data }) => {
       if (cancelled || !data.attempt_id) return
       setAttemptId(data.attempt_id)
-      setWarningCount(data.warning_count ?? 0)
+      setTimeLeft(data.time_remaining_seconds ?? (exam.duration_minutes * 60))
+      warningCountRef.current = data.warning_count ?? 0
+      setWarningCount(warningCountRef.current)
       setWarnings((data.warnings || []).map((warning) => ({
         id: warning.id,
         category: warning.category,
         message: warning.details?.message || warning.category.replaceAll('_', ' '),
         time: new Date(warning.created_at).toLocaleTimeString(),
+        count: warning.details?.warning_number,
       })))
       const lastMicrophoneWarning = (data.warnings || []).filter((warning) => warning.category === 'microphone_activity').at(-1)
       if (lastMicrophoneWarning) {
@@ -1086,13 +1107,20 @@ function ExamRoomPage({ exams }) {
       if (data.status === 'submitted') {
         submittedRef.current = true
         setIsSubmitted(true)
+        setSubmittedAt(data.submitted_at)
+        setSubmittedScore(data.score)
+        setSubmissionReason(data.submission_reason || '')
         setExamMessage(data.submission_reason === 'MAX_WARNINGS_REACHED'
           ? 'Maximum warnings reached. Your exam has been automatically submitted.'
           : 'This exam has already been submitted.')
       }
-    }).catch(() => {})
+    }).catch((error) => {
+      if (!cancelled) {
+        setExamMessage(error.response?.data?.detail || 'Unable to restore your exam attempt. Check your connection and retry.')
+      }
+    })
     return () => { cancelled = true }
-  }, [exam.id])
+  }, [exam.duration_minutes, exam.id])
 
   const fetchProctoringSummary = useCallback(async (currentAttemptId = attemptId) => {
     if (!currentAttemptId) return
@@ -1146,11 +1174,16 @@ function ExamRoomPage({ exams }) {
       }
       if (!response) {
         setExamMessage(lastError?.response?.data?.detail || 'A monitoring warning could not be saved. Check your connection before continuing.')
+        if (warningCountRef.current + Math.max(0, pendingEventCountRef.current - 1) < MAX_EXAM_WARNINGS) {
+          finalWarningPendingRef.current = false
+          setFinalWarningPending(false)
+        }
         return
       }
 
       const { data } = response
-      setWarningCount(data.warning_count ?? 0)
+      warningCountRef.current = data.warning_count ?? warningCountRef.current
+      setWarningCount(warningCountRef.current)
       setWarnings((current) => [{
         id: data.id || eventId,
         category,
@@ -1163,13 +1196,27 @@ function ExamRoomPage({ exams }) {
         submittedRef.current = true
         submissionLockRef.current = true
         setIsSubmitted(true)
+        setSubmittedAt(data.submitted_at)
+        setSubmittedScore(data.score)
+        setSubmissionReason(data.submission_reason || '')
         setIsSubmitting(false)
         setExamMessage('Maximum warnings reached. Your exam has been automatically submitted.')
         stopMediaResources()
+      } else {
+        setWarningNotice(`Warning ${data.warning_count}/${MAX_EXAM_WARNINGS}: ${message} Further qualifying violations will automatically submit your exam.`)
+        if (warningCountRef.current + Math.max(0, pendingEventCountRef.current - 1) < MAX_EXAM_WARNINGS) {
+          finalWarningPendingRef.current = false
+          setFinalWarningPending(false)
+        }
       }
     }
     const reportViolation = (category, message, source) => {
       pendingEventCountRef.current += 1
+      if (warningCountRef.current + pendingEventCountRef.current >= MAX_EXAM_WARNINGS) {
+        finalWarningPendingRef.current = true
+        setFinalWarningPending(true)
+        setWarningNotice('Final warning detected. Answer selection is locked while the event is saved and the exam is submitted.')
+      }
       const queued = warningQueueRef.current.then(() => sendViolation(category, message, source))
       warningQueueRef.current = queued.catch(() => {}).finally(() => {
         pendingEventCountRef.current = Math.max(0, pendingEventCountRef.current - 1)
@@ -1213,9 +1260,9 @@ function ExamRoomPage({ exams }) {
 
     const checkCamera = () => {
       if (!cameraTrack || cameraViolationLatchedRef.current) return
-      if (cameraTrack.readyState === 'ended' || !cameraTrack.enabled) {
+      if (cameraTrack.readyState === 'ended' || !cameraTrack.enabled || cameraTrack.muted) {
         cameraViolationLatchedRef.current = true
-        setCameraStatus(cameraTrack.readyState === 'ended' ? 'disconnected' : 'turned off')
+        setCameraStatus(cameraTrack.readyState === 'ended' || cameraTrack.muted ? 'disconnected' : 'turned off')
         setFaceStatus('Camera is unavailable. This camera violation has been recorded.')
         void reportViolation('camera_error', 'Camera was disconnected or turned off during the exam.', 'camera')
       }
@@ -1346,22 +1393,28 @@ function ExamRoomPage({ exams }) {
       await audioContextRef.current.resume()
       setMicrophoneStatus('permission granted')
 
-      let activeAttemptId = attemptId
-      if (!activeAttemptId) {
-        const { data } = await API.post(`/exams/${exam.id}/start/`)
-        activeAttemptId = data.attempt_id
-        setAttemptId(data.attempt_id)
-        setTimeLeft(exam.duration_minutes * 60)
-        setWarningCount(data.warning_count ?? 0)
-        setWarnings((data.warnings || []).map((warning) => ({
-          id: warning.id,
-          category: warning.category,
-          message: warning.details?.message || warning.category.replaceAll('_', ' '),
-          time: new Date(warning.created_at).toLocaleTimeString(),
-        })))
+      const { data } = await API.post(`/exams/${exam.id}/start/`)
+      const activeAttemptId = data.attempt_id
+      setAttemptId(activeAttemptId)
+      setTimeLeft(data.time_remaining_seconds ?? (exam.duration_minutes * 60))
+      warningCountRef.current = data.warning_count ?? 0
+      setWarningCount(warningCountRef.current)
+      setWarnings((data.warnings || []).map((warning) => ({
+        id: warning.id,
+        category: warning.category,
+        message: warning.details?.message || warning.category.replaceAll('_', ' '),
+        time: new Date(warning.created_at).toLocaleTimeString(),
+        count: warning.details?.warning_number,
+      })))
+      setSelectedOption(Object.fromEntries((data.answers || []).filter((answer) => answer.option_id).map((answer) => [answer.question_id, answer.option_id])))
+      const lastMicrophoneWarning = (data.warnings || []).filter((warning) => warning.category === 'microphone_activity').at(-1)
+      if (lastMicrophoneWarning) {
+        microphoneCooldownUntilRef.current = new Date(lastMicrophoneWarning.created_at).getTime() + MIC_COOLDOWN_MS
+        microphoneLatchedRef.current = Date.now() < microphoneCooldownUntilRef.current
       }
       if (!activeAttemptId) throw new Error('The server did not create an exam attempt.')
       setExamMessage('')
+      setWarningNotice('')
       submittedRef.current = false
       setMonitoringActive(true)
     } catch (error) {
@@ -1380,21 +1433,17 @@ function ExamRoomPage({ exams }) {
       setExamMessage('Start the exam before submitting. Your answers cannot be submitted until an attempt has started.')
       return
     }
-    if (isSubmitting || submissionLockRef.current || pendingEventCountRef.current > 0 || submittedRef.current) return
+    if (
+      isSubmitting
+      || submissionLockRef.current
+      || (reason !== 'TIME_EXPIRED' && pendingEventCountRef.current > 0)
+      || submittedRef.current
+    ) return
 
     submissionLockRef.current = true
     setIsSubmitting(true)
     setExamMessage('')
     try {
-      await Promise.all(
-        Object.entries(selectedOption).map(([questionId, optionId]) =>
-          API.post(`/attempts/${attemptId}/save-answer/`, {
-            question_id: Number(questionId),
-            option_id: optionId,
-            marked_for_review: false,
-          }),
-        ),
-      )
       const { data } = await API.post(`/attempts/${attemptId}/submit/`, {
         reason,
         answers: Object.entries(selectedOption).map(([questionId, optionId]) => ({
@@ -1408,6 +1457,9 @@ function ExamRoomPage({ exams }) {
       }
       submittedRef.current = true
       setIsSubmitted(true)
+      setSubmittedAt(data.submitted_at)
+      setSubmittedScore(data.score)
+      setSubmissionReason(data.submission_reason || reason)
       stopMediaResources()
       if (data.submission_reason === 'MAX_WARNINGS_REACHED') {
         setExamMessage('Maximum warnings reached. Your exam has been automatically submitted.')
@@ -1442,7 +1494,7 @@ function ExamRoomPage({ exams }) {
     }
   }
 
-  if (!exam || !Array.isArray(exam.questions) || exam.questions.length === 0) {
+  if (!isSubmitted && (!exam || !Array.isArray(exam.questions) || exam.questions.length === 0)) {
     return (
       <div className="mx-auto max-w-3xl px-4 py-16 text-center sm:px-6 lg:px-8">
         <div className="panel p-10">
@@ -1450,6 +1502,43 @@ function ExamRoomPage({ exams }) {
           <h1 className="mt-3 text-3xl font-bold text-slate-900">This exam could not be loaded.</h1>
           <p className="mt-4 text-slate-600">The selected exam is missing or incomplete. Please return to the exam list and try again.</p>
           <Link to="/exams" className="mt-6 inline-flex rounded-xl bg-slate-900 px-5 py-2.5 font-medium text-white">Back to exams</Link>
+        </div>
+      </div>
+    )
+  }
+
+  if (isSubmitted) {
+    return (
+      <div className="mx-auto max-w-3xl px-4 py-16 text-center sm:px-6 lg:px-8">
+        <div className="panel p-10">
+          <CheckCircle2 size={48} className="mx-auto text-emerald-600" />
+          <p className="mt-5 text-sm font-medium uppercase tracking-[0.2em] text-emerald-700">Exam submitted</p>
+          <h1 className="mt-2 text-3xl font-bold text-slate-900">Your exam has been submitted.</h1>
+          <p className="mt-3 text-slate-600">{exam.title}</p>
+          {submissionReason === 'MAX_WARNINGS_REACHED' && (
+            <p className="mt-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              The third qualifying monitoring warning automatically submitted your saved answers.
+            </p>
+          )}
+          <div className="mt-6 grid gap-3 rounded-2xl bg-slate-50 p-5 text-left sm:grid-cols-2">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Final status</p>
+              <p className="mt-1 font-semibold text-slate-900">Submitted</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Score</p>
+              <p className="mt-1 font-semibold text-slate-900">{submittedScore ?? 'Processing'}</p>
+            </div>
+            {submittedAt && (
+              <div className="sm:col-span-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Submitted at</p>
+                <p className="mt-1 font-semibold text-slate-900">{new Date(submittedAt).toLocaleString()}</p>
+              </div>
+            )}
+          </div>
+          <Link to="/results" className="mt-6 inline-flex rounded-xl bg-slate-900 px-5 py-2.5 font-medium text-white hover:bg-slate-800">
+            View my results
+          </Link>
         </div>
       </div>
     )
@@ -1487,6 +1576,11 @@ function ExamRoomPage({ exams }) {
             <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
               Shared warning count: <strong>{warningCount}/{MAX_EXAM_WARNINGS}</strong>. The third warning automatically submits this exam. Tab and focus monitoring can be imperfect and does not prevent switching.
             </p>
+            {warningNotice && (
+              <p role="status" className="mt-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900">
+                {warningNotice}
+              </p>
+            )}
             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
               <div className="mb-2 flex items-center justify-between text-sm">
                 <span className="font-medium text-slate-700">AI integrity score</span>
@@ -1565,10 +1659,11 @@ function ExamRoomPage({ exams }) {
                   type="button"
                   key={option.id}
                   onClick={() => {
+                    if (finalWarningPendingRef.current) return
                     setSelectedOption((prev) => ({ ...prev, [currentQuestion.id]: option.id }))
                     void saveAnswer(currentQuestion.id, option.id)
                   }}
-                  disabled={!monitoringActive || isSubmitting || isSubmitted}
+                  disabled={!monitoringActive || isSubmitting || isSubmitted || finalWarningPending}
                   className={`flex w-full items-start gap-3 rounded-xl border px-4 py-3 text-left transition ${selectedOption[currentQuestion.id] === option.id ? 'border-teal-500 bg-teal-50 text-teal-900' : 'border-slate-200 bg-white text-slate-700'}`}
                 >
                   <span className="mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-300 text-xs font-semibold">{String.fromCharCode(65 + currentQuestion.options.indexOf(option))}</span>

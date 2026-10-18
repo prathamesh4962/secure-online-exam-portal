@@ -1,26 +1,33 @@
-# React + Vite
+# Exam portal frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+This React 19 application uses Vite and communicates with the Django REST API.
 
-Currently, two official plugins are available:
+## Local development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```powershell
+npm ci
+npm run dev
+```
 
-## React Compiler
+The Vite development server proxies `/api` to `http://localhost:8000`. Set
+`VITE_API_BASE_URL` in a local `frontend/.env.local` only when using a separate
+backend origin; its value must include `/api`.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Production build and Vercel
 
-## Expanding the Oxlint configuration
+```powershell
+npm ci
+npm run build
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+Configure Vercel with `frontend` as the project root, `npm run build` as the
+build command, and `dist` as the output directory. Set
+`VITE_API_BASE_URL=https://<your-backend-host>/api` in the Vercel project's
+environment variables. Django and its persistent database are deployed
+separately; do not put backend secrets in Vite variables.
 
-## Microphone monitoring
-
-The exam room analyzes microphone levels locally and never records or uploads audio. Tune the defaults for the exam environment with these Vite variables:
-
-- `VITE_MIC_AUDIO_THRESHOLD` sets the RMS activity threshold (default `0.08`).
-- `VITE_MIC_SUSTAINED_MS` sets the required continuous duration in milliseconds (default `1500`).
-- `VITE_MIC_COOLDOWN_MS` sets the warning cooldown in milliseconds (default `10000`).
-
-These are frontend build-time settings, not secrets. Rebuild the frontend after changing them and test with the actual devices and room noise expected for the exam; detected audio is not evidence of cheating.
+The camera and microphone require a secure browser context (HTTPS). Microphone
+levels are processed locally and audio is never recorded or uploaded. The
+optional `VITE_MIC_AUDIO_THRESHOLD`, `VITE_MIC_SUSTAINED_MS`, and
+`VITE_MIC_COOLDOWN_MS` variables tune the local activity detector; defaults
+are `0.08`, `1500`, and `10000` respectively.

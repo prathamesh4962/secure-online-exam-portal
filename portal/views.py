@@ -1,4 +1,6 @@
 from collections import Counter
+from datetime import timedelta
+from math import ceil
 
 from django.contrib import auth
 from django.contrib.auth import authenticate, login, logout
@@ -77,6 +79,21 @@ def submit_attempt(attempt, reason):
     )
 
 
+def attempt_deadline(attempt):
+    duration_deadline = attempt.started_at + timedelta(minutes=attempt.exam.duration_minutes)
+    return min(duration_deadline, attempt.exam.end_time)
+
+
+def expire_attempt_if_needed(attempt):
+    if (
+        attempt.status != ExamAttempt.STATUS_SUBMITTED
+        and timezone.now() >= attempt_deadline(attempt)
+    ):
+        submit_attempt(attempt, ExamAttempt.SUBMISSION_TIME_EXPIRED)
+        return True
+    return False
+
+
 def submission_payload(attempt, already_submitted=False):
     return {
         'attempt_id': attempt.id,
@@ -96,8 +113,10 @@ def attempt_state_payload(attempt):
         'attempt_id': attempt.id,
         'status': attempt.status,
         'started_at': attempt.started_at.isoformat(),
+        'time_remaining_seconds': max(0, ceil((attempt_deadline(attempt) - timezone.now()).total_seconds())),
         'warning_count': attempt.warning_count,
         'warning_limit': MAX_EXAM_WARNINGS,
+        'score': round(attempt.score, 2),
         'submission_reason': attempt.submission_reason,
         'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
         'warnings': [{
@@ -523,11 +542,15 @@ def start_exam_view(request, exam_id):
     if exam.eligible_students.exists() and not exam.eligible_students.filter(id=request.user.id).exists():
         return Response({'detail': 'You are not eligible to take this exam.'}, status=403)
 
-    attempt, created = ExamAttempt.objects.get_or_create(student=request.user, exam=exam, defaults={'status': 'in_progress'})
-    if not created and attempt.status == 'submitted':
-        return Response({'detail': 'You have already submitted this exam.'}, status=400)
-    attempt.status = 'in_progress'
-    attempt.save(update_fields=['status'])
+    attempt, _ = ExamAttempt.objects.get_or_create(student=request.user, exam=exam, defaults={'status': 'in_progress'})
+    with transaction.atomic():
+        attempt = ExamAttempt.objects.select_for_update().get(pk=attempt.pk)
+        expire_attempt_if_needed(attempt)
+        if attempt.status == ExamAttempt.STATUS_SUBMITTED:
+            return Response({'detail': 'You have already submitted this exam.'}, status=400)
+        if attempt.status != ExamAttempt.STATUS_FLAGGED:
+            attempt.status = ExamAttempt.STATUS_IN_PROGRESS
+            attempt.save(update_fields=['status'])
     return Response(attempt_state_payload(attempt))
 
 
@@ -539,6 +562,9 @@ def exam_attempt_state_view(request, exam_id):
     attempt = ExamAttempt.objects.filter(student=request.user, exam_id=exam_id).first()
     if attempt is None:
         return Response({'attempt_id': None, 'status': 'not_started'})
+    with transaction.atomic():
+        attempt = ExamAttempt.objects.select_for_update().get(pk=attempt.pk)
+        expire_attempt_if_needed(attempt)
     return Response(attempt_state_payload(attempt))
 
 
@@ -547,26 +573,29 @@ def exam_attempt_state_view(request, exam_id):
 def save_answer_view(request, attempt_id):
     if request.user.role != 'student':
         return Response({'detail': 'Only students can answer questions.'}, status=403)
-    attempt = ExamAttempt.objects.get(pk=attempt_id, student=request.user)
-    if attempt.status == ExamAttempt.STATUS_SUBMITTED:
-        return Response({'detail': 'This exam attempt has already been submitted.'}, status=400)
-    question_id = request.data.get('question_id')
-    option_id = request.data.get('option_id')
-    marked_for_review = bool(request.data.get('marked_for_review'))
+    with transaction.atomic():
+        attempt = ExamAttempt.objects.select_for_update().get(pk=attempt_id, student=request.user)
+        if attempt.status == ExamAttempt.STATUS_SUBMITTED:
+            return Response({'detail': 'This exam attempt has already been submitted.'}, status=400)
+        if expire_attempt_if_needed(attempt):
+            return Response({'detail': 'The exam time has expired and this attempt has been submitted.'}, status=400)
+        question_id = request.data.get('question_id')
+        option_id = request.data.get('option_id')
+        marked_for_review = bool(request.data.get('marked_for_review'))
 
-    if question_id is None:
-        return Response({'detail': 'Question id is required.'}, status=400)
+        if question_id is None:
+            return Response({'detail': 'Question id is required.'}, status=400)
 
-    question = Question.objects.get(pk=question_id, exam=attempt.exam)
-    option = None
-    if option_id is not None:
-        option = Option.objects.get(pk=option_id, question=question)
+        question = Question.objects.get(pk=question_id, exam=attempt.exam)
+        option = None
+        if option_id is not None:
+            option = Option.objects.get(pk=option_id, question=question)
 
-    answer, _ = Answer.objects.update_or_create(
-        attempt=attempt,
-        question=question,
-        defaults={'selected_option': option, 'marked_for_review': marked_for_review},
-    )
+        answer, _ = Answer.objects.update_or_create(
+            attempt=attempt,
+            question=question,
+            defaults={'selected_option': option, 'marked_for_review': marked_for_review},
+        )
     return Response({'id': answer.id, 'question_id': question.id})
 
 
@@ -584,12 +613,18 @@ def submit_exam_view(request, attempt_id):
         attempt = ExamAttempt.objects.select_for_update().get(pk=attempt_id, student=request.user)
         if attempt.status == ExamAttempt.STATUS_SUBMITTED:
             return Response(submission_payload(attempt, already_submitted=True))
+        time_expired = timezone.now() >= attempt_deadline(attempt)
+        if reason == ExamAttempt.SUBMISSION_TIME_EXPIRED and not time_expired:
+            return Response({'detail': 'The exam time has not expired.'}, status=400)
         try:
-            if 'answers' in request.data:
+            if 'answers' in request.data and not time_expired:
                 save_attempt_answers(attempt, request.data['answers'])
         except ValueError as error:
             return Response({'detail': str(error)}, status=400)
-        submit_attempt(attempt, reason)
+        submit_attempt(
+            attempt,
+            ExamAttempt.SUBMISSION_TIME_EXPIRED if time_expired else reason,
+        )
     return Response(submission_payload(attempt))
 
 
@@ -702,6 +737,18 @@ def incident_create_view(request):
                     'warning_limit': MAX_EXAM_WARNINGS,
                     'auto_submitted': False,
                     'submission_reason': attempt.submission_reason,
+                    'submitted_at': attempt.submitted_at.isoformat(),
+                    'score': round(attempt.score, 2),
+                })
+            if expire_attempt_if_needed(attempt):
+                return Response({
+                    'status': 'submitted',
+                    'warning_count': attempt.warning_count,
+                    'warning_limit': MAX_EXAM_WARNINGS,
+                    'auto_submitted': False,
+                    'submission_reason': attempt.submission_reason,
+                    'submitted_at': attempt.submitted_at.isoformat(),
+                    'score': round(attempt.score, 2),
                 })
 
         if counted_warning:
@@ -715,6 +762,8 @@ def incident_create_view(request):
                     'warning_limit': MAX_EXAM_WARNINGS,
                     'auto_submitted': attempt.status == ExamAttempt.STATUS_SUBMITTED,
                     'submission_reason': attempt.submission_reason,
+                    'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+                    'score': round(attempt.score, 2),
                 })
             details = dict(details) if isinstance(details, dict) else {'message': str(details)}
             details['warning_number'] = attempt.warning_count + 1
@@ -754,6 +803,8 @@ def incident_create_view(request):
         'warning_limit': MAX_EXAM_WARNINGS,
         'auto_submitted': auto_submitted,
         'submission_reason': attempt.submission_reason,
+        'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        'score': round(attempt.score, 2) if auto_submitted else None,
     }, status=201)
 
 
@@ -767,29 +818,26 @@ def proctoring_analysis_view(request):
     image_data = payload.get('image') or payload.get('image_data') or payload.get('frame')
     if not image_data:
         return Response({'detail': 'A webcam frame is required.'}, status=400)
+    exam_id = payload.get('exam_id')
+    attempt_id = payload.get('attempt_id')
+    if not exam_id or not attempt_id:
+        return Response({'detail': 'An active exam attempt is required.'}, status=400)
+    attempt = ExamAttempt.objects.filter(
+        pk=attempt_id,
+        student=request.user,
+        exam_id=exam_id,
+    ).first()
+    if attempt is None:
+        return Response({'detail': 'The exam attempt was not found.'}, status=404)
 
-    result = analyze_frame(image_data)
-    if result.get('status') == 'warning':
-        exam_id = payload.get('exam_id')
-        attempt_id = payload.get('attempt_id')
-        exam = Exam.objects.filter(pk=exam_id).first() if exam_id else None
-        attempt = None
-        if attempt_id:
-            attempt = ExamAttempt.objects.filter(pk=attempt_id, student=request.user).first()
-        if exam:
-            severity = 'high' if not result.get('face_detected') else 'medium'
-            incident = Incident.objects.create(
-                student=request.user,
-                exam=exam,
-                attempt=attempt,
-                category='face_missing' if not result.get('face_detected') else 'technical_failure',
-                severity=severity,
-                source='camera',
-                details=result,
-            )
-            maybe_flag_attempt(attempt, incident.severity)
+    with transaction.atomic():
+        attempt = ExamAttempt.objects.select_for_update().get(pk=attempt.pk)
+        if attempt.status == ExamAttempt.STATUS_SUBMITTED:
+            return Response({'detail': 'This exam attempt has already been submitted.'}, status=409)
+        if expire_attempt_if_needed(attempt):
+            return Response({'detail': 'The exam time has expired and this attempt has been submitted.'}, status=409)
 
-    return Response(result)
+    return Response(analyze_frame(image_data))
 
 
 @api_view(['GET'])

@@ -8,6 +8,21 @@ A full-stack examination portal with role-based access for students, faculty, an
 - `backend/` — Django project settings and API entry points
 - `portal/` — exam, user, attempt, answer, and incident models and API logic
 
+## Exam monitoring and submissions
+
+Camera interruption, tab/window focus changes, and sustained microphone activity
+share a server-maintained three-warning limit. Duplicate monitoring event IDs do
+not count twice. On the third qualifying event, the backend saves the submitted
+answers and finalizes the attempt once; the frontend displays the submission
+status and timestamp. The server also enforces the earlier of the exam duration
+and scheduled end time, so refreshing the page cannot reset the timer or permit
+late answer changes.
+
+Camera permission, live preview, and interruption checks run in the browser.
+Microphone levels are analyzed locally with a configurable threshold and
+cooldown; audio is never recorded or uploaded. Monitoring begins only after the
+student grants the requested device permissions and starts or resumes the exam.
+
 ## Local development
 
 ### Backend
@@ -39,17 +54,11 @@ The frontend can be deployed to Vercel. Django must be deployed separately to a 
 
 ### Django backend (Render + PostgreSQL)
 
-1. Create a PostgreSQL database and a Python web service connected to this repository.
-2. Set the web service root to the repository root.
-3. Use `pip install -r requirements.txt` as the build command.
-4. Use `python manage.py migrate && python manage.py collectstatic --noinput` as a pre-deploy command, and `gunicorn backend.wsgi:application` as the start command.
-5. Configure these environment variables on the backend:
-   - `DEBUG=False`
-   - `DJANGO_SECRET_KEY` — a newly generated random secret
-   - `ALLOWED_HOSTS` — the backend's exact Render hostname
-   - `FRONTEND_URLS` — the exact Vercel production origin (include preview origins only if needed)
-   - `DATABASE_URL` — Render's internal PostgreSQL connection URL
-6. Create the first administrator through a one-off shell/console command; do not enable public administrator registration.
+The root `render.yaml` defines a Render Blueprint for the Django API and persistent PostgreSQL database. Connect the repository in Render and review the database plan and its current price before confirming resource creation. The web service uses Render's free plan and may sleep when idle; the database is persistent and billed according to the selected plan.
+
+The Blueprint generates `DJANGO_SECRET_KEY` and connects the database through `DATABASE_URL`. It sets `DEBUG=False` and the Vercel production origin in `FRONTEND_URLS`. Render's `RENDER_EXTERNAL_HOSTNAME` is added to `ALLOWED_HOSTS` automatically. Database migrations run when the web service starts.
+
+After the backend is healthy, set Vercel's production `VITE_API_BASE_URL` to `https://<your-backend-host>/api` and redeploy the frontend. Add the exact Vercel origin to `FRONTEND_URLS` in Render and redeploy the backend.
 
 The production settings enable secure cookies and PostgreSQL SSL when `DEBUG=False`. Since the frontend and backend are on separate origins, the Vercel origin must be listed in both `FRONTEND_URLS` and `CSRF_TRUSTED_ORIGINS` (the latter is populated from `FRONTEND_URLS`).
 

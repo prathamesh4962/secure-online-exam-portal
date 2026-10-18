@@ -19,6 +19,9 @@ if not DEBUG and SECRET_KEY in {'dev-secret-key-change-me', 'replace-with-a-stro
     raise ImproperlyConfigured('Set DJANGO_SECRET_KEY to a unique secret when DEBUG=False.')
 
 ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,[::1],0.0.0.0,testserver').split(',') if host.strip()]
+RENDER_EXTERNAL_HOSTNAME = os.getenv('RENDER_EXTERNAL_HOSTNAME')
+if RENDER_EXTERNAL_HOSTNAME:
+    ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
 
 INSTALLED_APPS = [
     'django.contrib.admin',
