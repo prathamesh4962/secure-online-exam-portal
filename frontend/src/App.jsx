@@ -46,6 +46,11 @@ const API = axios.create({
   xsrfHeaderName: 'X-CSRFToken',
 })
 
+const MAX_EXAM_WARNINGS = 3
+const MIC_AUDIO_THRESHOLD = Number(import.meta.env.VITE_MIC_AUDIO_THRESHOLD || 0.08)
+const MIC_SUSTAINED_MS = Number(import.meta.env.VITE_MIC_SUSTAINED_MS || 1500)
+const MIC_COOLDOWN_MS = Number(import.meta.env.VITE_MIC_COOLDOWN_MS || 10000)
+
 const defaultStats = {
   student: { exams_available: 7, attempted: 4, incidents: 1, average_score: 83 },
   faculty: { created_exams: 5, attempts: 120, incidents: 3 },
@@ -1010,18 +1015,84 @@ function ExamRoomPage({ exams }) {
   const exam = exams.find((item) => String(item.id) === examId) || examSeed
   const questions = Array.isArray(exam?.questions) ? exam.questions : []
   const videoRef = useRef(null)
+  const cameraStreamRef = useRef(null)
+  const microphoneStreamRef = useRef(null)
+  const audioContextRef = useRef(null)
+  const monitoringCleanupRef = useRef(null)
+  const submittedRef = useRef(false)
+  const tabAwayRef = useRef(false)
   const [attemptId, setAttemptId] = useState(null)
   const submitExamRef = useRef(null)
+  const submissionLockRef = useRef(false)
+  const pendingEventCountRef = useRef(0)
+  const warningQueueRef = useRef(Promise.resolve())
+  const microphoneStartedAtRef = useRef(null)
+  const microphoneLatchedRef = useRef(false)
+  const microphoneCooldownUntilRef = useRef(0)
+  const cameraViolationLatchedRef = useRef(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isStarting, setIsStarting] = useState(false)
+  const [isSubmitted, setIsSubmitted] = useState(false)
+  const [monitoringActive, setMonitoringActive] = useState(false)
   const [examMessage, setExamMessage] = useState('')
   const [cameraStatus, setCameraStatus] = useState('checking')
+  const [microphoneStatus, setMicrophoneStatus] = useState('not connected')
   const [faceStatus, setFaceStatus] = useState('Checking face presence...')
+  const [warningCount, setWarningCount] = useState(0)
   const [timeLeft, setTimeLeft] = useState((exam?.duration_minutes ?? 0) * 60)
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [selectedOption, setSelectedOption] = useState({})
   const [warnings, setWarnings] = useState([])
   const [riskSummary, setRiskSummary] = useState({ total_events: 0, risk_score: 12, risk_level: 'Low', categories: {}, severity: {} })
   const navigate = useNavigate()
+
+  const stopMediaResources = () => {
+    monitoringCleanupRef.current?.()
+    monitoringCleanupRef.current = null
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      void audioContextRef.current.close()
+    }
+    audioContextRef.current = null
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop())
+    microphoneStreamRef.current?.getTracks().forEach((track) => track.stop())
+    cameraStreamRef.current = null
+    microphoneStreamRef.current = null
+    if (videoRef.current) videoRef.current.srcObject = null
+    setMonitoringActive(false)
+    setCameraStatus('stopped')
+    setMicrophoneStatus('stopped')
+  }
+
+  useEffect(() => () => stopMediaResources(), [])
+
+  useEffect(() => {
+    let cancelled = false
+    API.get(`/exams/${exam.id}/attempt/`).then(({ data }) => {
+      if (cancelled || !data.attempt_id) return
+      setAttemptId(data.attempt_id)
+      setWarningCount(data.warning_count ?? 0)
+      setWarnings((data.warnings || []).map((warning) => ({
+        id: warning.id,
+        category: warning.category,
+        message: warning.details?.message || warning.category.replaceAll('_', ' '),
+        time: new Date(warning.created_at).toLocaleTimeString(),
+      })))
+      const lastMicrophoneWarning = (data.warnings || []).filter((warning) => warning.category === 'microphone_activity').at(-1)
+      if (lastMicrophoneWarning) {
+        microphoneCooldownUntilRef.current = new Date(lastMicrophoneWarning.created_at).getTime() + MIC_COOLDOWN_MS
+        microphoneLatchedRef.current = Date.now() < microphoneCooldownUntilRef.current
+      }
+      setSelectedOption(Object.fromEntries((data.answers || []).filter((answer) => answer.option_id).map((answer) => [answer.question_id, answer.option_id])))
+      if (data.status === 'submitted') {
+        submittedRef.current = true
+        setIsSubmitted(true)
+        setExamMessage(data.submission_reason === 'MAX_WARNINGS_REACHED'
+          ? 'Maximum warnings reached. Your exam has been automatically submitted.'
+          : 'This exam has already been submitted.')
+      }
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [exam.id])
 
   const fetchProctoringSummary = useCallback(async (currentAttemptId = attemptId) => {
     if (!currentAttemptId) return
@@ -1040,158 +1111,210 @@ function ExamRoomPage({ exams }) {
   }, [attemptId, fetchProctoringSummary])
 
   useEffect(() => {
-    const capture = async () => {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setCameraStatus('unsupported')
-        setFaceStatus('This browser does not support webcam access.')
+    if (!attemptId || !monitoringActive || isSubmitting || isSubmitted) return undefined
+
+    const cameraTrack = cameraStreamRef.current?.getVideoTracks()[0]
+    const microphoneTrack = microphoneStreamRef.current?.getAudioTracks()[0]
+
+    const sendViolation = async (category, message, source) => {
+      if (submittedRef.current || submissionLockRef.current) return
+      const eventId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`
+      const answers = Object.entries(selectedOption).map(([questionId, optionId]) => ({
+        question_id: Number(questionId),
+        option_id: optionId,
+        marked_for_review: false,
+      }))
+      let response
+      let lastError
+      for (let retry = 0; retry < 3; retry += 1) {
+        try {
+          response = await API.post('/incidents/create/', {
+            exam_id: exam.id,
+            attempt_id: attemptId,
+            event_id: eventId,
+            category,
+            severity: 'medium',
+            source,
+            details: { message },
+            answers,
+          })
+          break
+        } catch (error) {
+          lastError = error
+          if (retry < 2) await new Promise((resolve) => setTimeout(resolve, 350 * (retry + 1)))
+        }
+      }
+      if (!response) {
+        setExamMessage(lastError?.response?.data?.detail || 'A monitoring warning could not be saved. Check your connection before continuing.')
         return
       }
 
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream
-        }
-        setCameraStatus('live')
-        setFaceStatus('Camera ready. Face detection is monitoring.')
-
-        const canvas = document.createElement('canvas')
-        const ctx = canvas.getContext('2d')
-        let frameIndex = 0
-        const detect = () => {
-          if (videoRef.current && videoRef.current.readyState >= 2) {
-            const video = videoRef.current
-            const width = 160
-            const height = 120
-            canvas.width = width
-            canvas.height = height
-            ctx.drawImage(video, 0, 0, width, height)
-            const image = ctx.getImageData(0, 0, width, height).data
-            let brightness = 0
-            for (let i = 0; i < image.length; i += 4) {
-              brightness += image[i] + image[i + 1] + image[i + 2]
-            }
-            const avg = brightness / (width * height * 3)
-            if (avg < 45) {
-              setFaceStatus('Low-light condition detected — check camera visibility.')
-            } else {
-              setFaceStatus('Camera active and face check stable.')
-            }
-          }
-          frameIndex += 1
-          if (frameIndex < 120) requestAnimationFrame(detect)
-        }
-        requestAnimationFrame(detect)
-
-        const analyzeStream = async () => {
-          if (!attemptId || !videoRef.current || videoRef.current.readyState < 2) return
-
-          const video = videoRef.current
-          const sampleCanvas = document.createElement('canvas')
-          sampleCanvas.width = video.videoWidth || 640
-          sampleCanvas.height = video.videoHeight || 480
-          const sampleCtx = sampleCanvas.getContext('2d')
-          sampleCtx.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height)
-          const frameData = sampleCanvas.toDataURL('image/jpeg', 0.75)
-
-          try {
-            const { data } = await API.post('/proctoring/analyze/', {
-              exam_id: exam.id,
-              attempt_id: attemptId,
-              image: frameData,
-            })
-
-            if (data.face_detected) {
-              setFaceStatus(`Face detected with ${data.face_confidence}% confidence.`)
-            } else {
-              setFaceStatus('Face not detected — please reposition in front of the camera.')
-            }
-          } catch {
-            setFaceStatus('Camera analysis is temporarily unavailable; retrying in a moment.')
-          }
-        }
-
-        const interval = setInterval(() => {
-          analyzeStream()
-        }, 5000)
-
-        return () => {
-          clearInterval(interval)
-          stream.getTracks().forEach((track) => track.stop())
-        }
-      } catch (error) {
-        setCameraStatus('denied')
-        setFaceStatus('Camera permission denied or unavailable. Please enable access before continuing.')
+      const { data } = response
+      setWarningCount(data.warning_count ?? 0)
+      setWarnings((current) => [{
+        id: data.id || eventId,
+        category,
+        message,
+        time: new Date().toLocaleTimeString(),
+        count: data.warning_count,
+      }, ...current].slice(0, 6))
+      void fetchProctoringSummary(attemptId)
+      if (data.auto_submitted || data.status === 'submitted') {
+        submittedRef.current = true
+        submissionLockRef.current = true
+        setIsSubmitted(true)
+        setIsSubmitting(false)
+        setExamMessage('Maximum warnings reached. Your exam has been automatically submitted.')
+        stopMediaResources()
       }
     }
-
-    capture()
-  }, [attemptId, exam.id, fetchProctoringSummary])
-
-  useEffect(() => {
-    const logWarning = (category, message) => {
-      setWarnings((current) => [{ id: Date.now(), category, message, time: new Date().toLocaleTimeString() }, ...current].slice(0, 4))
-      if (attemptId) {
-        API.post('/incidents/create/', {
-          exam_id: exam.id,
-          attempt_id: attemptId,
-          category,
-          severity: 'medium',
-          source: 'browser',
-          details: { message },
-        }).catch(() => {})
-        fetchProctoringSummary(attemptId)
-      }
+    const reportViolation = (category, message, source) => {
+      pendingEventCountRef.current += 1
+      const queued = warningQueueRef.current.then(() => sendViolation(category, message, source))
+      warningQueueRef.current = queued.catch(() => {}).finally(() => {
+        pendingEventCountRef.current = Math.max(0, pendingEventCountRef.current - 1)
+      })
+      return queued
     }
 
     const handleVisibility = () => {
-      if (document.hidden) logWarning('tab_switch', 'Page visibility changed while the exam was active.')
+      if (document.hidden) {
+        tabAwayRef.current = true
+      } else if (tabAwayRef.current) {
+        tabAwayRef.current = false
+        void reportViolation('tab_switch', 'The exam page was hidden or the window lost focus.', 'browser')
+      }
     }
-    const handleBlur = () => logWarning('tab_switch', 'Window lost focus during the exam.')
+    const handleBlur = () => { tabAwayRef.current = true }
+    const handleFocus = () => {
+      if (!document.hidden && tabAwayRef.current) {
+        tabAwayRef.current = false
+        void reportViolation('tab_switch', 'The browser window lost focus during the exam.', 'browser')
+      }
+    }
+
     const handleCopy = (event) => {
       event.preventDefault()
-      logWarning('copy_paste', 'Copy action blocked in exam mode.')
+      void API.post('/incidents/create/', { exam_id: exam.id, attempt_id: attemptId, category: 'copy_paste', source: 'browser', details: { message: 'Copy action blocked in exam mode.' } })
     }
     const handlePaste = (event) => {
       event.preventDefault()
-      logWarning('copy_paste', 'Paste action blocked in exam mode.')
+      void API.post('/incidents/create/', { exam_id: exam.id, attempt_id: attemptId, category: 'copy_paste', source: 'browser', details: { message: 'Paste action blocked in exam mode.' } })
     }
     const handleCut = (event) => {
       event.preventDefault()
-      logWarning('copy_paste', 'Cut action blocked in exam mode.')
+      void API.post('/incidents/create/', { exam_id: exam.id, attempt_id: attemptId, category: 'copy_paste', source: 'browser', details: { message: 'Cut action blocked in exam mode.' } })
     }
     const handleKeyDown = (event) => {
       if ((event.ctrlKey || event.metaKey) && ['c', 'v', 'x'].includes(event.key.toLowerCase())) {
         event.preventDefault()
-        logWarning('copy_paste', `Keyboard shortcut blocked: Ctrl+${event.key.toLowerCase()}`)
       }
+    }
+
+    const checkCamera = () => {
+      if (!cameraTrack || cameraViolationLatchedRef.current) return
+      if (cameraTrack.readyState === 'ended' || !cameraTrack.enabled) {
+        cameraViolationLatchedRef.current = true
+        setCameraStatus(cameraTrack.readyState === 'ended' ? 'disconnected' : 'turned off')
+        setFaceStatus('Camera is unavailable. This camera violation has been recorded.')
+        void reportViolation('camera_error', 'Camera was disconnected or turned off during the exam.', 'camera')
+      }
+    }
+    const cameraCheckInterval = setInterval(checkCamera, 750)
+    const analyzeCameraFrame = async () => {
+      const video = videoRef.current
+      if (!video || video.readyState < 2 || cameraViolationLatchedRef.current) return
+      const canvas = document.createElement('canvas')
+      canvas.width = video.videoWidth || 640
+      canvas.height = video.videoHeight || 480
+      const context = canvas.getContext('2d')
+      if (!context) return
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      try {
+        const { data } = await API.post('/proctoring/analyze/', {
+          exam_id: exam.id,
+          attempt_id: attemptId,
+          image: canvas.toDataURL('image/jpeg', 0.75),
+        })
+        setFaceStatus(data.face_detected
+          ? `Face detected with ${data.face_confidence}% confidence.`
+          : 'Face not detected; please reposition in front of the camera.')
+      } catch {
+        setFaceStatus('Camera analysis is temporarily unavailable; retrying in a moment.')
+      }
+    }
+    const faceAnalysisInterval = setInterval(() => { void analyzeCameraFrame() }, 5000)
+
+    let audioCheckInterval
+    let audioSource
+    if (microphoneTrack && audioContextRef.current) {
+      const audioContext = audioContextRef.current
+      const analyser = audioContext.createAnalyser()
+      analyser.fftSize = 2048
+      audioSource = audioContext.createMediaStreamSource(microphoneStreamRef.current)
+      audioSource.connect(analyser)
+      const samples = new Float32Array(analyser.fftSize)
+      audioCheckInterval = setInterval(() => {
+        if (microphoneTrack.readyState === 'ended' || !microphoneTrack.enabled) {
+          setMicrophoneStatus('unavailable')
+          return
+        }
+        analyser.getFloatTimeDomainData(samples)
+        let energy = 0
+        for (const sample of samples) energy += sample * sample
+        const audioLevel = Math.sqrt(energy / samples.length)
+        const now = Date.now()
+        if (audioLevel >= MIC_AUDIO_THRESHOLD) {
+          if (microphoneStartedAtRef.current === null) microphoneStartedAtRef.current = now
+          if (!microphoneLatchedRef.current && now - microphoneStartedAtRef.current >= MIC_SUSTAINED_MS && now >= microphoneCooldownUntilRef.current) {
+            microphoneLatchedRef.current = true
+            microphoneCooldownUntilRef.current = now + MIC_COOLDOWN_MS
+            void reportViolation('microphone_activity', 'Sustained audio activity exceeded the local monitoring threshold.', 'microphone')
+          }
+        } else {
+          microphoneStartedAtRef.current = null
+          microphoneLatchedRef.current = false
+        }
+      }, 100)
+    } else {
+      setMicrophoneStatus('unavailable')
     }
 
     document.addEventListener('visibilitychange', handleVisibility)
     window.addEventListener('blur', handleBlur)
+    window.addEventListener('focus', handleFocus)
     document.addEventListener('copy', handleCopy)
     document.addEventListener('paste', handlePaste)
     document.addEventListener('cut', handleCut)
     document.addEventListener('keydown', handleKeyDown)
-
-    return () => {
+    monitoringCleanupRef.current = () => {
+      clearInterval(cameraCheckInterval)
+      clearInterval(faceAnalysisInterval)
+      if (audioCheckInterval) clearInterval(audioCheckInterval)
+      audioSource?.disconnect()
       document.removeEventListener('visibilitychange', handleVisibility)
       window.removeEventListener('blur', handleBlur)
+      window.removeEventListener('focus', handleFocus)
       document.removeEventListener('copy', handleCopy)
       document.removeEventListener('paste', handlePaste)
       document.removeEventListener('cut', handleCut)
       document.removeEventListener('keydown', handleKeyDown)
     }
-  }, [attemptId, exam.id])
+
+    return () => {
+      monitoringCleanupRef.current?.()
+      monitoringCleanupRef.current = null
+    }
+  }, [attemptId, exam.id, fetchProctoringSummary, isSubmitted, isSubmitting, monitoringActive, selectedOption])
 
   useEffect(() => {
-    if (!attemptId) return undefined
+    if (!attemptId || isSubmitted) return undefined
 
     const timer = setInterval(() => {
       setTimeLeft((current) => {
         if (current <= 1) {
           clearInterval(timer)
-          void submitExamRef.current?.()
+          void submitExamRef.current?.('TIME_EXPIRED')
           return 0
         }
         return current - 1
@@ -1199,27 +1322,67 @@ function ExamRoomPage({ exams }) {
     }, 1000)
 
     return () => clearInterval(timer)
-  }, [attemptId])
+  }, [attemptId, isSubmitted])
 
   const handleStartExam = async () => {
+    if (isStarting || monitoringActive || isSubmitted) return
+    setIsStarting(true)
+    let requestingDevice = 'camera'
     try {
-      const { data } = await API.post(`/exams/${exam.id}/start/`)
-      setAttemptId(data.attempt_id)
-      setTimeLeft(exam.duration_minutes * 60)
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('This browser does not support camera and microphone access.')
+      }
+      const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true })
+      cameraStreamRef.current = cameraStream
+      setCameraStatus('live')
+      if (videoRef.current) videoRef.current.srcObject = cameraStream
+      requestingDevice = 'microphone'
+      const microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      microphoneStreamRef.current = microphoneStream
+      if (!globalThis.AudioContext) {
+        throw new Error('This browser does not support local microphone monitoring.')
+      }
+      audioContextRef.current = new AudioContext()
+      await audioContextRef.current.resume()
+      setMicrophoneStatus('permission granted')
+
+      let activeAttemptId = attemptId
+      if (!activeAttemptId) {
+        const { data } = await API.post(`/exams/${exam.id}/start/`)
+        activeAttemptId = data.attempt_id
+        setAttemptId(data.attempt_id)
+        setTimeLeft(exam.duration_minutes * 60)
+        setWarningCount(data.warning_count ?? 0)
+        setWarnings((data.warnings || []).map((warning) => ({
+          id: warning.id,
+          category: warning.category,
+          message: warning.details?.message || warning.category.replaceAll('_', ' '),
+          time: new Date(warning.created_at).toLocaleTimeString(),
+        })))
+      }
+      if (!activeAttemptId) throw new Error('The server did not create an exam attempt.')
       setExamMessage('')
-      setWarnings((current) => [{ id: Date.now(), category: 'camera', message: 'Exam started successfully.', time: new Date().toLocaleTimeString() }, ...current].slice(0, 4))
+      submittedRef.current = false
+      setMonitoringActive(true)
     } catch (error) {
-      setExamMessage(error.response?.data?.detail || 'Unable to start the exam.')
+      stopMediaResources()
+      const permissionDenied = error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError'
+      if (permissionDenied && requestingDevice === 'camera') setCameraStatus('permission denied')
+      if (permissionDenied && requestingDevice === 'microphone') setMicrophoneStatus('permission denied')
+      setExamMessage(error.response?.data?.detail || error.message || 'Unable to start the exam.')
+    } finally {
+      setIsStarting(false)
     }
   }
 
-  const handleSubmitExam = useCallback(async () => {
+  const handleSubmitExam = useCallback(async (reason = 'MANUAL') => {
     if (!attemptId) {
       setExamMessage('Start the exam before submitting. Your answers cannot be submitted until an attempt has started.')
       return
     }
-    if (isSubmitting) return
+    if (isSubmitting || submissionLockRef.current || pendingEventCountRef.current > 0 || submittedRef.current) return
 
+    submissionLockRef.current = true
     setIsSubmitting(true)
     setExamMessage('')
     try {
@@ -1232,14 +1395,29 @@ function ExamRoomPage({ exams }) {
           }),
         ),
       )
-      const { data } = await API.post(`/attempts/${attemptId}/submit/`)
+      const { data } = await API.post(`/attempts/${attemptId}/submit/`, {
+        reason,
+        answers: Object.entries(selectedOption).map(([questionId, optionId]) => ({
+          question_id: Number(questionId),
+          option_id: optionId,
+          marked_for_review: false,
+        })),
+      })
       if (data.status !== 'submitted') {
         throw new Error('The server did not confirm exam submission.')
       }
-      navigate('/results')
+      submittedRef.current = true
+      setIsSubmitted(true)
+      stopMediaResources()
+      if (data.submission_reason === 'MAX_WARNINGS_REACHED') {
+        setExamMessage('Maximum warnings reached. Your exam has been automatically submitted.')
+      } else {
+        navigate('/results')
+      }
     } catch (error) {
       setExamMessage(error.response?.data?.detail || error.message || 'Submission failed. Please try again.')
       setIsSubmitting(false)
+      submissionLockRef.current = false
     }
   }, [attemptId, isSubmitting, navigate, selectedOption])
 
@@ -1293,15 +1471,21 @@ function ExamRoomPage({ exams }) {
         <div className="space-y-6">
           <div className="panel p-5">
             <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-slate-900">Camera and microphone pre-check</h2>
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900">Camera and microphone monitoring</h2>
+                <p className="mt-1 text-sm text-slate-600">Microphone audio levels are analyzed locally. Audio is not recorded or stored.</p>
+              </div>
               <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${cameraStatus === 'live' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
                 {cameraStatus}
               </span>
             </div>
             <video ref={videoRef} autoPlay playsInline muted />
             <p className="mt-3 text-sm text-slate-600">{faceStatus}</p>
+            <p className="mt-3 text-sm text-slate-600" role="status">
+              Microphone: {monitoringActive ? 'active; audio processed locally' : microphoneStatus}
+            </p>
             <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
-              Rule: up to {exam.max_suspicious_activity ?? 3} suspicious camera/microphone events are allowed before the attempt is flagged.
+              Shared warning count: <strong>{warningCount}/{MAX_EXAM_WARNINGS}</strong>. The third warning automatically submits this exam. Tab and focus monitoring can be imperfect and does not prevent switching.
             </p>
             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
               <div className="mb-2 flex items-center justify-between text-sm">
@@ -1320,9 +1504,9 @@ function ExamRoomPage({ exams }) {
                 </div>
               </div>
             </div>
-            {!attemptId && (
-              <button type="button" onClick={handleStartExam} className="mt-4 w-full rounded-xl bg-teal-600 px-4 py-3 font-medium text-white hover:bg-teal-500">
-                Start exam
+            {!monitoringActive && !isSubmitted && (
+              <button type="button" onClick={handleStartExam} disabled={isStarting} className="mt-4 w-full rounded-xl bg-teal-600 px-4 py-3 font-medium text-white hover:bg-teal-500 disabled:cursor-wait disabled:opacity-60">
+                {isStarting ? 'Requesting permissions…' : attemptId ? 'Resume exam monitoring' : 'Grant permissions and start exam'}
               </button>
             )}
             {examMessage && (
@@ -1333,7 +1517,7 @@ function ExamRoomPage({ exams }) {
           </div>
 
           <div className="panel p-5">
-            <h2 className="text-lg font-semibold text-slate-900">Proctoring warnings</h2>
+            <h2 className="text-lg font-semibold text-slate-900">Proctoring warnings ({warningCount}/{MAX_EXAM_WARNINGS})</h2>
             <div className="mt-4 space-y-3">
               {warnings.length === 0 ? (
                 <p className="text-sm text-slate-500">No integrity warnings detected.</p>
@@ -1341,7 +1525,7 @@ function ExamRoomPage({ exams }) {
                 warnings.map((warning) => (
                   <div key={warning.id} className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="font-semibold uppercase tracking-wide">{warning.category}</span>
+                      <span className="font-semibold uppercase tracking-wide">{warning.count ? `Warning ${warning.count}: ` : ''}{warning.category.replaceAll('_', ' ')}</span>
                       <span>{warning.time}</span>
                     </div>
                     <p className="mt-1">{warning.message}</p>
@@ -1384,7 +1568,7 @@ function ExamRoomPage({ exams }) {
                     setSelectedOption((prev) => ({ ...prev, [currentQuestion.id]: option.id }))
                     void saveAnswer(currentQuestion.id, option.id)
                   }}
-                  disabled={!attemptId || isSubmitting}
+                  disabled={!monitoringActive || isSubmitting || isSubmitted}
                   className={`flex w-full items-start gap-3 rounded-xl border px-4 py-3 text-left transition ${selectedOption[currentQuestion.id] === option.id ? 'border-teal-500 bg-teal-50 text-teal-900' : 'border-slate-200 bg-white text-slate-700'}`}
                 >
                   <span className="mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-300 text-xs font-semibold">{String.fromCharCode(65 + currentQuestion.options.indexOf(option))}</span>
@@ -1400,10 +1584,10 @@ function ExamRoomPage({ exams }) {
             <button
               type="button"
               onClick={() => void handleSubmitExam()}
-              disabled={!attemptId || isSubmitting}
+              disabled={!attemptId || !monitoringActive || isSubmitting || isSubmitted}
               className={`rounded-xl px-5 py-2.5 font-medium text-white ${!attemptId || isSubmitting ? 'cursor-not-allowed bg-slate-400' : 'bg-slate-900 hover:bg-slate-800'}`}
             >
-              {isSubmitting ? 'Submitting…' : attemptId ? 'Submit exam' : 'Start exam to submit'}
+              {examMessage.includes('Maximum warnings reached') ? 'Automatically submitted' : isSubmitting ? 'Submitting…' : attemptId && monitoringActive ? 'Submit exam' : 'Start monitoring to answer'}
             </button>
           </div>
         </div>

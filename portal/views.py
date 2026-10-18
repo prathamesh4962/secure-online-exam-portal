@@ -2,7 +2,7 @@ from collections import Counter
 
 from django.contrib import auth
 from django.contrib.auth import authenticate, login, logout
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Avg
 from django.middleware.csrf import get_token
 from django.utils import timezone
@@ -13,22 +13,114 @@ from rest_framework.response import Response
 from .models import Answer, AuditLog, Exam, ExamAttempt, Incident, Option, Question, User
 from .proctoring_service import analyze_frame
 
+MAX_EXAM_WARNINGS = 3
+COUNTED_WARNING_CATEGORIES = {
+    Incident.CATEGORY_CAMERA_ERROR,
+    Incident.CATEGORY_TAB_SWITCH,
+    Incident.CATEGORY_MICROPHONE_ACTIVITY,
+}
+
+
+def save_attempt_answers(attempt, answers):
+    if not isinstance(answers, list):
+        raise ValueError('answers must be a list.')
+
+    validated_answers = []
+    for answer_data in answers:
+        if not isinstance(answer_data, dict) or answer_data.get('question_id') is None:
+            raise ValueError('Each answer must include a question_id.')
+        question = Question.objects.filter(pk=answer_data['question_id'], exam=attempt.exam).first()
+        if question is None:
+            raise ValueError('An answer references a question outside this attempt.')
+
+        option_id = answer_data.get('option_id')
+        option = None
+        if option_id is not None:
+            option = Option.objects.filter(pk=option_id, question=question).first()
+            if option is None:
+                raise ValueError('An answer references an option outside its question.')
+        validated_answers.append((question, option, bool(answer_data.get('marked_for_review', False))))
+
+    for question, option, marked_for_review in validated_answers:
+        Answer.objects.update_or_create(
+            attempt=attempt,
+            question=question,
+            defaults={
+                'selected_option': option,
+                'marked_for_review': marked_for_review,
+            },
+        )
+
+
+def submit_attempt(attempt, reason):
+    score = 0
+    for answer in attempt.answers.select_related('question', 'selected_option'):
+        if answer.selected_option is None:
+            continue
+        if answer.selected_option.is_correct:
+            score += float(answer.question.marks)
+        else:
+            score -= float(answer.question.negative_mark)
+    score = max(score, 0)
+
+    attempt.score = score
+    attempt.status = ExamAttempt.STATUS_SUBMITTED
+    attempt.submitted_at = timezone.now()
+    attempt.submission_reason = reason
+    attempt.save(update_fields=['score', 'status', 'submitted_at', 'submission_reason', 'warning_count'])
+    AuditLog.objects.create(
+        actor=attempt.student,
+        action='submit_exam',
+        model_name='ExamAttempt',
+        target_id=str(attempt.id),
+        details={'score': score, 'reason': reason},
+    )
+
+
+def submission_payload(attempt, already_submitted=False):
+    return {
+        'attempt_id': attempt.id,
+        'score': round(attempt.score, 2),
+        'status': attempt.status,
+        'warning_count': attempt.warning_count,
+        'warning_limit': MAX_EXAM_WARNINGS,
+        'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        'submission_reason': attempt.submission_reason,
+        'already_submitted': already_submitted,
+    }
+
+
+def attempt_state_payload(attempt):
+    incidents = attempt.incidents.filter(category__in=COUNTED_WARNING_CATEGORIES).order_by('created_at')
+    return {
+        'attempt_id': attempt.id,
+        'status': attempt.status,
+        'started_at': attempt.started_at.isoformat(),
+        'warning_count': attempt.warning_count,
+        'warning_limit': MAX_EXAM_WARNINGS,
+        'submission_reason': attempt.submission_reason,
+        'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        'warnings': [{
+            'id': incident.id,
+            'event_id': incident.event_id,
+            'category': incident.category,
+            'details': incident.details,
+            'created_at': incident.created_at.isoformat(),
+        } for incident in incidents],
+        'answers': [{
+            'question_id': answer.question_id,
+            'option_id': answer.selected_option_id,
+        } for answer in attempt.answers.all()],
+    }
+
 
 def maybe_flag_attempt(attempt, severity):
     if attempt is None:
         return
 
-    suspicious_categories = {'face_missing', 'camera_error', 'technical_failure'}
-    suspicious_sources = {'camera', 'microphone'}
-    incident_count = Incident.objects.filter(attempt=attempt).filter(
-        models.Q(category__in=suspicious_categories) | models.Q(source__in=suspicious_sources)
-    ).count()
-    threshold = attempt.exam.max_suspicious_activity if attempt.exam else 3
-
-    if severity in {'high', 'critical'} or incident_count >= threshold:
-        if attempt.status != 'flagged':
-            attempt.status = 'flagged'
-            attempt.save(update_fields=['status'])
+    if severity in {'high', 'critical'} and attempt.status != 'flagged':
+        attempt.status = 'flagged'
+        attempt.save(update_fields=['status'])
 
 
 def build_proctoring_summary(incidents):
@@ -436,7 +528,18 @@ def start_exam_view(request, exam_id):
         return Response({'detail': 'You have already submitted this exam.'}, status=400)
     attempt.status = 'in_progress'
     attempt.save(update_fields=['status'])
-    return Response({'attempt_id': attempt.id, 'status': attempt.status, 'started_at': attempt.started_at.isoformat()})
+    return Response(attempt_state_payload(attempt))
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def exam_attempt_state_view(request, exam_id):
+    if request.user.role != 'student':
+        return Response({'detail': 'Only students can resume an exam attempt.'}, status=403)
+    attempt = ExamAttempt.objects.filter(student=request.user, exam_id=exam_id).first()
+    if attempt is None:
+        return Response({'attempt_id': None, 'status': 'not_started'})
+    return Response(attempt_state_payload(attempt))
 
 
 @api_view(['POST'])
@@ -445,6 +548,8 @@ def save_answer_view(request, attempt_id):
     if request.user.role != 'student':
         return Response({'detail': 'Only students can answer questions.'}, status=403)
     attempt = ExamAttempt.objects.get(pk=attempt_id, student=request.user)
+    if attempt.status == ExamAttempt.STATUS_SUBMITTED:
+        return Response({'detail': 'This exam attempt has already been submitted.'}, status=400)
     question_id = request.data.get('question_id')
     option_id = request.data.get('option_id')
     marked_for_review = bool(request.data.get('marked_for_review'))
@@ -471,28 +576,21 @@ def submit_exam_view(request, attempt_id):
     if request.user.role != 'student':
         return Response({'detail': 'Only students can submit exams.'}, status=403)
 
-    attempt = ExamAttempt.objects.get(pk=attempt_id, student=request.user)
-    if attempt.status == 'submitted':
-        return Response({'detail': 'Exam already submitted.'}, status=400)
+    reason = request.data.get('reason', ExamAttempt.SUBMISSION_MANUAL)
+    if reason not in {ExamAttempt.SUBMISSION_MANUAL, ExamAttempt.SUBMISSION_TIME_EXPIRED}:
+        return Response({'detail': 'Invalid submission reason.'}, status=400)
 
-    score = 0
-    for answer in attempt.answers.select_related('question', 'selected_option'):
-        if answer.selected_option is None:
-            continue
-        if answer.selected_option.is_correct:
-            score += float(answer.question.marks)
-        else:
-            score -= float(answer.question.negative_mark)
-    if score < 0:
-        score = 0
-
-    attempt.score = score
-    attempt.status = 'submitted'
-    attempt.submitted_at = timezone.now()
-    attempt.save(update_fields=['score', 'status', 'submitted_at'])
-
-    AuditLog.objects.create(actor=request.user, action='submit_exam', model_name='ExamAttempt', target_id=str(attempt.id), details={'score': score})
-    return Response({'attempt_id': attempt.id, 'score': round(score, 2), 'status': attempt.status})
+    with transaction.atomic():
+        attempt = ExamAttempt.objects.select_for_update().get(pk=attempt_id, student=request.user)
+        if attempt.status == ExamAttempt.STATUS_SUBMITTED:
+            return Response(submission_payload(attempt, already_submitted=True))
+        try:
+            if 'answers' in request.data:
+                save_attempt_answers(attempt, request.data['answers'])
+        except ValueError as error:
+            return Response({'detail': str(error)}, status=400)
+        submit_attempt(attempt, reason)
+    return Response(submission_payload(attempt))
 
 
 @api_view(['GET'])
@@ -575,22 +673,88 @@ def incident_create_view(request):
 
     if not exam_id:
         return Response({'detail': 'exam_id is required.'}, status=400)
+    if category not in {choice[0] for choice in Incident.CATEGORY_CHOICES}:
+        return Response({'detail': 'Invalid incident category.'}, status=400)
+    if severity not in {choice[0] for choice in Incident.SEVERITY_CHOICES}:
+        return Response({'detail': 'Invalid incident severity.'}, status=400)
     exam = Exam.objects.get(pk=exam_id)
-    attempt = None
     if attempt_id:
-        attempt = ExamAttempt.objects.filter(pk=attempt_id, student=request.user).first()
+        attempt = ExamAttempt.objects.filter(pk=attempt_id, student=request.user, exam=exam).first()
+        if attempt is None:
+            return Response({'detail': 'The exam attempt was not found.'}, status=404)
+    else:
+        attempt = None
 
-    incident = Incident.objects.create(
-        student=request.user,
-        exam=exam,
-        attempt=attempt,
-        category=category,
-        severity=severity,
-        source=source,
-        details=details,
-    )
-    maybe_flag_attempt(attempt, incident.severity)
-    return Response({'id': incident.id, 'status': 'created'}, status=201)
+    counted_warning = category in COUNTED_WARNING_CATEGORIES
+    event_id = request.data.get('event_id')
+    if counted_warning and (not attempt or not event_id):
+        return Response({'detail': 'A valid attempt_id and event_id are required for monitoring warnings.'}, status=400)
+    if counted_warning and (not isinstance(event_id, str) or len(event_id) > 64):
+        return Response({'detail': 'event_id must be a string of at most 64 characters.'}, status=400)
+
+    with transaction.atomic():
+        if attempt:
+            attempt = ExamAttempt.objects.select_for_update().get(pk=attempt.pk)
+            if attempt.status == ExamAttempt.STATUS_SUBMITTED:
+                return Response({
+                    'status': 'submitted',
+                    'warning_count': attempt.warning_count,
+                    'warning_limit': MAX_EXAM_WARNINGS,
+                    'auto_submitted': False,
+                    'submission_reason': attempt.submission_reason,
+                })
+
+        if counted_warning:
+            if existing := Incident.objects.filter(event_id=event_id).first():
+                if existing.attempt_id != attempt.id:
+                    return Response({'detail': 'event_id has already been used by another attempt.'}, status=409)
+                return Response({
+                    'id': existing.id,
+                    'status': 'duplicate',
+                    'warning_count': attempt.warning_count,
+                    'warning_limit': MAX_EXAM_WARNINGS,
+                    'auto_submitted': attempt.status == ExamAttempt.STATUS_SUBMITTED,
+                    'submission_reason': attempt.submission_reason,
+                })
+            details = dict(details) if isinstance(details, dict) else {'message': str(details)}
+            details['warning_number'] = attempt.warning_count + 1
+            auto_submitted = attempt.warning_count + 1 >= MAX_EXAM_WARNINGS
+            if auto_submitted:
+                try:
+                    if 'answers' in request.data:
+                        save_attempt_answers(attempt, request.data['answers'])
+                except ValueError as error:
+                    return Response({'detail': str(error)}, status=400)
+
+        incident = Incident.objects.create(
+            student=request.user,
+            exam=exam,
+            attempt=attempt,
+            category=category,
+            severity=severity,
+            source=source,
+            details=details,
+            event_id=event_id if counted_warning else None,
+        )
+        if not counted_warning:
+            maybe_flag_attempt(attempt, incident.severity)
+            return Response({'id': incident.id, 'status': 'created', 'warning_count': attempt.warning_count}, status=201)
+
+        attempt.warning_count += 1
+        auto_submitted = attempt.warning_count >= MAX_EXAM_WARNINGS
+        if auto_submitted:
+            submit_attempt(attempt, ExamAttempt.SUBMISSION_MAX_WARNINGS_REACHED)
+        else:
+            attempt.save(update_fields=['warning_count'])
+
+    return Response({
+        'id': incident.id,
+        'status': attempt.status,
+        'warning_count': attempt.warning_count,
+        'warning_limit': MAX_EXAM_WARNINGS,
+        'auto_submitted': auto_submitted,
+        'submission_reason': attempt.submission_reason,
+    }, status=201)
 
 
 @api_view(['POST'])

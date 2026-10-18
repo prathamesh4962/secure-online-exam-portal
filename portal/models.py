@@ -82,6 +82,9 @@ class ExamAttempt(models.Model):
     STATUS_IN_PROGRESS = 'in_progress'
     STATUS_SUBMITTED = 'submitted'
     STATUS_FLAGGED = 'flagged'
+    SUBMISSION_MANUAL = 'MANUAL'
+    SUBMISSION_MAX_WARNINGS_REACHED = 'MAX_WARNINGS_REACHED'
+    SUBMISSION_TIME_EXPIRED = 'TIME_EXPIRED'
     STATUS_CHOICES = [
         (STATUS_IN_PROGRESS, 'In progress'),
         (STATUS_SUBMITTED, 'Submitted'),
@@ -92,6 +95,8 @@ class ExamAttempt(models.Model):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='attempts')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_IN_PROGRESS)
     score = models.FloatField(default=0)
+    warning_count = models.PositiveSmallIntegerField(default=0)
+    submission_reason = models.CharField(max_length=32, blank=True, default='')
     started_at = models.DateTimeField(auto_now_add=True)
     submitted_at = models.DateTimeField(blank=True, null=True)
 
@@ -118,6 +123,7 @@ class Incident(models.Model):
     CATEGORY_COPY_PASTE = 'copy_paste'
     CATEGORY_FACE_MISSING = 'face_missing'
     CATEGORY_CAMERA_ERROR = 'camera_error'
+    CATEGORY_MICROPHONE_ACTIVITY = 'microphone_activity'
     CATEGORY_POLICY = 'policy_violation'
     CATEGORY_TECHNICAL = 'technical_failure'
     CATEGORY_CHOICES = [
@@ -125,6 +131,7 @@ class Incident(models.Model):
         (CATEGORY_COPY_PASTE, 'Copy/paste'),
         (CATEGORY_FACE_MISSING, 'Face missing'),
         (CATEGORY_CAMERA_ERROR, 'Camera error'),
+        (CATEGORY_MICROPHONE_ACTIVITY, 'Microphone activity'),
         (CATEGORY_POLICY, 'Policy violation'),
         (CATEGORY_TECHNICAL, 'Technical failure'),
     ]
@@ -156,25 +163,20 @@ class Incident(models.Model):
     severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, default=SEVERITY_MEDIUM)
     source = models.CharField(max_length=50, default='browser')
     details = models.JSONField(default=dict, blank=True)
+    event_id = models.CharField(max_length=64, blank=True, null=True, unique=True)
     review_status = models.CharField(max_length=20, choices=REVIEW_STATUS_CHOICES, default=REVIEW_PENDING)
     reviewer_notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
-        if self.attempt is not None:
-            suspicious_categories = {'face_missing', 'camera_error', 'technical_failure'}
-            suspicious_sources = {'camera', 'microphone'}
-            incident_count = Incident.objects.filter(
-                attempt=self.attempt,
-            ).filter(
-                models.Q(category__in=suspicious_categories) | models.Q(source__in=suspicious_sources)
-            ).count()
-            threshold = self.attempt.exam.max_suspicious_activity if self.attempt.exam else 3
-            if self.severity in {'high', 'critical'} or incident_count >= threshold:
-                if self.attempt.status != 'flagged':
-                    self.attempt.status = 'flagged'
-                    self.attempt.save(update_fields=['status'])
+        if (
+            self.attempt is not None
+            and self.attempt.status not in {'submitted', 'flagged'}
+            and self.severity in {'high', 'critical'}
+        ):
+            self.attempt.status = 'flagged'
+            self.attempt.save(update_fields=['status'])
 
 
 class AuditLog(models.Model):

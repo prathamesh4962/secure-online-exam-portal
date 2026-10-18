@@ -3,7 +3,7 @@ from datetime import timedelta
 from django.test import TestCase
 from django.utils import timezone
 
-from .models import Exam, ExamAttempt, Incident, Option, Question, User
+from .models import AuditLog, Exam, ExamAttempt, Incident, Option, Question, User
 
 
 class AuthFlowTests(TestCase):
@@ -103,35 +103,6 @@ class AuthFlowTests(TestCase):
         attempt.refresh_from_db()
         self.assertEqual(attempt.status, 'flagged')
 
-    def test_exam_flags_after_max_suspicious_activity_limit(self):
-        faculty = User.objects.create_user(username='faculty03', email='faculty03@example.com', password='SecurePass123', role='faculty')
-        student = User.objects.create_user(username='student04', email='student04@example.com', password='SecurePass123', role='student')
-        exam = Exam.objects.create(
-            title='Limited Suspicion Exam',
-            description='Only three suspicious camera events allowed',
-            subject='Cybersecurity',
-            duration_minutes=30,
-            start_time=timezone.now(),
-            end_time=timezone.now() + timedelta(minutes=30),
-            max_suspicious_activity=3,
-            created_by=faculty,
-        )
-        attempt = ExamAttempt.objects.create(student=student, exam=exam, status='in_progress')
-
-        for index in range(3):
-            Incident.objects.create(
-                student=student,
-                exam=exam,
-                attempt=attempt,
-                category='camera_error' if index % 2 == 0 else 'face_missing',
-                severity='medium',
-                source='camera',
-                details={'detail': f'Camera issue {index + 1}'},
-            )
-
-        attempt.refresh_from_db()
-        self.assertEqual(attempt.status, 'flagged')
-
     def test_admin_can_manage_users(self):
         admin = User.objects.create_user(username='admin01', email='admin01@example.com', password='SecurePass123', role='admin')
         self.client.force_login(admin)
@@ -189,3 +160,92 @@ class AuthFlowTests(TestCase):
         self.assertEqual(attempt.status, 'submitted')
         self.assertEqual(attempt.score, 5)
         self.assertIsNotNone(attempt.submitted_at)
+
+        repeated_submit = self.client.post(f'/api/attempts/{attempt_id}/submit/')
+        self.assertEqual(repeated_submit.status_code, 200)
+        self.assertTrue(repeated_submit.json()['already_submitted'])
+        self.assertEqual(AuditLog.objects.filter(action='submit_exam', target_id=str(attempt_id)).count(), 1)
+
+
+class CombinedWarningTests(TestCase):
+    def setUp(self):
+        faculty = User.objects.create_user(username='faculty_warnings', email='faculty_warnings@example.com', password='SecurePass123', role='faculty')
+        self.student = User.objects.create_user(username='student_warnings', email='student_warnings@example.com', password='SecurePass123', role='student')
+        self.exam = Exam.objects.create(
+            title='Combined Warning Exam',
+            duration_minutes=30,
+            start_time=timezone.now() - timedelta(minutes=1),
+            end_time=timezone.now() + timedelta(minutes=30),
+            status='published',
+            max_suspicious_activity=1,
+            created_by=faculty,
+        )
+        self.question = Question.objects.create(exam=self.exam, text='Saved answer?', marks=5, order=1)
+        self.option = Option.objects.create(question=self.question, text='Yes', is_correct=True, order=1)
+        self.client.force_login(self.student)
+        start = self.client.post(f'/api/exams/{self.exam.id}/start/')
+        self.assertEqual(start.status_code, 200)
+        self.attempt_id = start.json()['attempt_id']
+
+    def report_warning(self, category, event_id, answers=None):
+        return self.client.post(
+            '/api/incidents/create/',
+            {
+                'exam_id': self.exam.id,
+                'attempt_id': self.attempt_id,
+                'event_id': event_id,
+                'category': category,
+                'severity': 'medium',
+                'source': 'camera' if category == 'camera_error' else 'microphone' if category == 'microphone_activity' else 'browser',
+                'details': {'message': f'{category} observed'},
+                'answers': answers or [],
+            },
+            content_type='application/json',
+        )
+
+    def assert_warning_sequence_submits(self, categories):
+        for index, category in enumerate(categories, start=1):
+            answer_payload = [{'question_id': self.question.id, 'option_id': self.option.id}] if index == 3 else []
+            response = self.report_warning(category, f'event-{index}', answer_payload)
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(response.json()['warning_count'], index)
+            self.assertEqual(response.json()['auto_submitted'], index == 3)
+
+        attempt = ExamAttempt.objects.get(pk=self.attempt_id)
+        self.assertEqual(attempt.status, ExamAttempt.STATUS_SUBMITTED)
+        self.assertEqual(attempt.warning_count, 3)
+        self.assertEqual(attempt.submission_reason, ExamAttempt.SUBMISSION_MAX_WARNINGS_REACHED)
+        self.assertIsNotNone(attempt.submitted_at)
+        self.assertEqual(attempt.answers.get(question=self.question).selected_option, self.option)
+        self.assertEqual(Incident.objects.filter(attempt=attempt).count(), 3)
+        self.assertEqual(AuditLog.objects.filter(action='submit_exam', target_id=str(attempt.id)).count(), 1)
+
+    def test_camera_then_two_tab_switches_auto_submits(self):
+        self.assert_warning_sequence_submits(['camera_error', 'tab_switch', 'tab_switch'])
+
+    def test_microphone_camera_tab_switch_share_counter(self):
+        self.assert_warning_sequence_submits(['microphone_activity', 'camera_error', 'tab_switch'])
+
+    def test_three_separate_microphone_events_auto_submit(self):
+        self.assert_warning_sequence_submits(['microphone_activity'] * 3)
+
+    def test_duplicate_event_does_not_increment_and_refresh_restores_count(self):
+        first = self.report_warning('tab_switch', 'stable-event-id')
+        self.assertEqual(first.status_code, 201)
+        second = self.report_warning('tab_switch', 'stable-event-id')
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()['status'], 'duplicate')
+        self.assertEqual(second.json()['warning_count'], 1)
+
+        state = self.client.get(f'/api/exams/{self.exam.id}/attempt/')
+        self.assertEqual(state.status_code, 200)
+        self.assertEqual(state.json()['warning_count'], 1)
+        self.assertEqual(len(state.json()['warnings']), 1)
+
+    def test_warning_limit_is_three_even_when_exam_legacy_limit_differs(self):
+        self.assertEqual(self.exam.max_suspicious_activity, 1)
+        first = self.report_warning('camera_error', 'camera-1')
+        second = self.report_warning('tab_switch', 'tab-2')
+        self.assertEqual(first.json()['warning_count'], 1)
+        self.assertEqual(second.json()['warning_count'], 2)
+        self.assertEqual(ExamAttempt.objects.get(pk=self.attempt_id).status, ExamAttempt.STATUS_IN_PROGRESS)
