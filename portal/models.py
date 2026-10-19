@@ -122,6 +122,8 @@ class Incident(models.Model):
     CATEGORY_TAB_SWITCH = 'tab_switch'
     CATEGORY_COPY_PASTE = 'copy_paste'
     CATEGORY_FACE_MISSING = 'face_missing'
+    CATEGORY_FACE_MOVEMENT = 'face_movement'
+    CATEGORY_MULTIPLE_FACES = 'multiple_faces'
     CATEGORY_CAMERA_ERROR = 'camera_error'
     CATEGORY_MICROPHONE_ACTIVITY = 'microphone_activity'
     CATEGORY_POLICY = 'policy_violation'
@@ -130,6 +132,8 @@ class Incident(models.Model):
         (CATEGORY_TAB_SWITCH, 'Tab switch'),
         (CATEGORY_COPY_PASTE, 'Copy/paste'),
         (CATEGORY_FACE_MISSING, 'Face missing'),
+        (CATEGORY_FACE_MOVEMENT, 'Face movement'),
+        (CATEGORY_MULTIPLE_FACES, 'Multiple faces'),
         (CATEGORY_CAMERA_ERROR, 'Camera error'),
         (CATEGORY_MICROPHONE_ACTIVITY, 'Microphone activity'),
         (CATEGORY_POLICY, 'Policy violation'),

@@ -233,6 +233,44 @@ class CombinedWarningTests(TestCase):
     def test_three_separate_microphone_events_auto_submit(self):
         self.assert_warning_sequence_submits(['microphone_activity'] * 3)
 
+    def test_each_detection_category_counts_once_and_duplicate_ids_are_ignored(self):
+        categories = [
+            'microphone_activity',
+            'face_missing',
+            'face_movement',
+            'multiple_faces',
+            'tab_switch',
+        ]
+        attempt = ExamAttempt.objects.get(pk=self.attempt_id)
+
+        for index, category in enumerate(categories, start=1):
+            event_id = f'detection-{index}'
+            first = self.report_warning(category, event_id)
+            duplicate = self.report_warning(category, event_id)
+
+            self.assertEqual(first.status_code, 201, category)
+            self.assertEqual(first.json()['warning_count'], 1, category)
+            self.assertEqual(duplicate.status_code, 200, category)
+            self.assertEqual(duplicate.json()['status'], 'duplicate', category)
+            self.assertEqual(duplicate.json()['warning_count'], 1, category)
+
+            Incident.objects.filter(attempt=attempt).delete()
+            attempt.warning_count = 0
+            attempt.save(update_fields=['warning_count'])
+
+    def test_face_warning_types_auto_submit_and_save_reason(self):
+        self.assert_warning_sequence_submits([
+            'face_missing',
+            'face_movement',
+            'multiple_faces',
+        ])
+
+        state = self.client.get(f'/api/exams/{self.exam.id}/attempt/')
+        self.assertEqual(state.status_code, 200)
+        self.assertEqual(state.json()['status'], ExamAttempt.STATUS_SUBMITTED)
+        self.assertEqual(state.json()['warning_count'], 3)
+        self.assertEqual(state.json()['submission_reason'], ExamAttempt.SUBMISSION_MAX_WARNINGS_REACHED)
+
     def test_duplicate_event_does_not_increment_and_refresh_restores_count(self):
         first = self.report_warning('tab_switch', 'stable-event-id')
         self.assertEqual(first.status_code, 201)
@@ -338,3 +376,25 @@ class CombinedWarningTests(TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(analyze_frame.call_count, 2)
         self.assertFalse(Incident.objects.filter(attempt_id=self.attempt_id).exists())
+
+    @patch('portal.views.analyze_frame', return_value={
+        'face_detected': True,
+        'face_count': 2,
+        'face_confidence': 50,
+        'status': 'ok',
+        'detail': 'Faces detected.',
+    })
+    def test_frame_analysis_exposes_face_count_for_multiple_face_detection(self, analyze_frame):
+        response = self.client.post(
+            '/api/proctoring/analyze/',
+            {
+                'exam_id': self.exam.id,
+                'attempt_id': self.attempt_id,
+                'image': 'data:image/jpeg;base64,ZmFrZQ==',
+            },
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['face_count'], 2)
+        analyze_frame.assert_called_once()

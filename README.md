@@ -10,12 +10,14 @@ A full-stack examination portal with role-based access for students, faculty, an
 
 ## Exam monitoring and submissions
 
-Camera interruption, tab/window focus changes, and sustained microphone activity
-share a server-maintained three-warning limit. Duplicate monitoring event IDs do
-not count twice. On the third qualifying event, the backend saves the submitted
-answers and finalizes the attempt once; the frontend displays the submission
-status and timestamp. The server also enforces the earlier of the exam duration
-and scheduled end time, so refreshing the page cannot reset the timer or permit
+Camera interruption, missing or multiple faces, significant face movement,
+tab/window focus changes, and sustained microphone activity share a
+server-maintained three-warning limit. Each continuous face condition is
+counted once until it clears, and duplicate monitoring event IDs do not count
+twice. On the third qualifying event, the backend saves the submitted answers
+and finalizes the attempt once; the frontend displays the submission status
+and timestamp. The server also enforces the earlier of the exam duration and
+scheduled end time, so refreshing the page cannot reset the timer or permit
 late answer changes.
 
 Camera permission, live preview, and interruption checks run in the browser.
@@ -77,4 +79,6 @@ Browser camera access requires HTTPS, which Vercel provides. Cross-origin sessio
 - Use a persistent database and configure backups before using real exam records.
 - Review the proctoring privacy, consent, retention, and incident-review policies before real-world use.
 - The browser monitoring and frame checks provide signals for human review; they are not proof of misconduct.
-- Run backend checks with `python manage.py test` and build the frontend with `npm run build`.
+- Run backend checks with `python manage.py test`, frontend detector tests with
+  `node --test src/proctoring.test.js` from `frontend/`, and build the frontend
+  with `npm run build`.

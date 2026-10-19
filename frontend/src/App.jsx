@@ -37,6 +37,12 @@ import {
   useNavigate,
   useParams,
 } from 'react-router-dom'
+import {
+  consumeTabSwitch,
+  createFaceDetectionState,
+  detectFaceWarning,
+  detectMicrophoneWarning,
+} from './proctoring.js'
 import './App.css'
 
 const API = axios.create({
@@ -444,9 +450,13 @@ function AuthPage({ user, onLogin, onRegister }) {
       navigate('/dashboard')
     } catch (error) {
       const contentType = error.response?.headers?.['content-type'] || ''
-      setAuthError(!error.response || contentType.includes('text/html')
-        ? 'The exam API is not connected yet. Please try again after backend deployment is complete.'
-        : error.response?.data?.detail || 'Authentication failed.')
+      if (!error.response) {
+        setAuthError('Cannot reach the backend API. Check that the Django server is running, then try again.')
+      } else if (contentType.includes('text/html')) {
+        setAuthError('The API returned an unexpected HTML response. Check the API URL or frontend proxy configuration.')
+      } else {
+        setAuthError(error.response.data?.detail || 'Authentication failed.')
+      }
     }
   }
 
@@ -1037,10 +1047,9 @@ function ExamRoomPage({ exams }) {
   const submissionLockRef = useRef(false)
   const pendingEventCountRef = useRef(0)
   const warningQueueRef = useRef(Promise.resolve())
-  const microphoneStartedAtRef = useRef(null)
-  const microphoneLatchedRef = useRef(false)
-  const microphoneCooldownUntilRef = useRef(0)
+  const microphoneDetectionRef = useRef({ startedAt: null, latched: false, cooldownUntil: 0 })
   const cameraViolationLatchedRef = useRef(false)
+  const faceDetectionStateRef = useRef(createFaceDetectionState())
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(false)
@@ -1100,8 +1109,8 @@ function ExamRoomPage({ exams }) {
       })))
       const lastMicrophoneWarning = (data.warnings || []).filter((warning) => warning.category === 'microphone_activity').at(-1)
       if (lastMicrophoneWarning) {
-        microphoneCooldownUntilRef.current = new Date(lastMicrophoneWarning.created_at).getTime() + MIC_COOLDOWN_MS
-        microphoneLatchedRef.current = Date.now() < microphoneCooldownUntilRef.current
+        microphoneDetectionRef.current.cooldownUntil = new Date(lastMicrophoneWarning.created_at).getTime() + MIC_COOLDOWN_MS
+        microphoneDetectionRef.current.latched = Date.now() < microphoneDetectionRef.current.cooldownUntil
       }
       setSelectedOption(Object.fromEntries((data.answers || []).filter((answer) => answer.option_id).map((answer) => [answer.question_id, answer.option_id])))
       if (data.status === 'submitted') {
@@ -1227,15 +1236,13 @@ function ExamRoomPage({ exams }) {
     const handleVisibility = () => {
       if (document.hidden) {
         tabAwayRef.current = true
-      } else if (tabAwayRef.current) {
-        tabAwayRef.current = false
+      } else if (consumeTabSwitch(tabAwayRef)) {
         void reportViolation('tab_switch', 'The exam page was hidden or the window lost focus.', 'browser')
       }
     }
     const handleBlur = () => { tabAwayRef.current = true }
     const handleFocus = () => {
-      if (!document.hidden && tabAwayRef.current) {
-        tabAwayRef.current = false
+      if (!document.hidden && consumeTabSwitch(tabAwayRef)) {
         void reportViolation('tab_switch', 'The browser window lost focus during the exam.', 'browser')
       }
     }
@@ -1283,8 +1290,14 @@ function ExamRoomPage({ exams }) {
           attempt_id: attemptId,
           image: canvas.toDataURL('image/jpeg', 0.75),
         })
+        const faceWarning = detectFaceWarning(data, faceDetectionStateRef.current, canvas.width, canvas.height)
+        if (faceWarning) {
+          void reportViolation(faceWarning.category, faceWarning.message, 'camera')
+        }
         setFaceStatus(data.face_detected
-          ? `Face detected with ${data.face_confidence}% confidence.`
+          ? data.face_count > 1
+            ? `${data.face_count} faces detected; only the exam candidate should be in view.`
+            : `Face detected with ${data.face_confidence}% confidence.`
           : 'Face not detected; please reposition in front of the camera.')
       } catch {
         setFaceStatus('Camera analysis is temporarily unavailable; retrying in a moment.')
@@ -1311,16 +1324,15 @@ function ExamRoomPage({ exams }) {
         for (const sample of samples) energy += sample * sample
         const audioLevel = Math.sqrt(energy / samples.length)
         const now = Date.now()
-        if (audioLevel >= MIC_AUDIO_THRESHOLD) {
-          if (microphoneStartedAtRef.current === null) microphoneStartedAtRef.current = now
-          if (!microphoneLatchedRef.current && now - microphoneStartedAtRef.current >= MIC_SUSTAINED_MS && now >= microphoneCooldownUntilRef.current) {
-            microphoneLatchedRef.current = true
-            microphoneCooldownUntilRef.current = now + MIC_COOLDOWN_MS
-            void reportViolation('microphone_activity', 'Sustained audio activity exceeded the local monitoring threshold.', 'microphone')
-          }
-        } else {
-          microphoneStartedAtRef.current = null
-          microphoneLatchedRef.current = false
+        if (detectMicrophoneWarning(
+          audioLevel,
+          now,
+          microphoneDetectionRef.current,
+          MIC_AUDIO_THRESHOLD,
+          MIC_SUSTAINED_MS,
+          MIC_COOLDOWN_MS,
+        )) {
+          void reportViolation('microphone_activity', 'Sustained audio activity exceeded the local monitoring threshold.', 'microphone')
         }
       }, 100)
     } else {
@@ -1409,8 +1421,8 @@ function ExamRoomPage({ exams }) {
       setSelectedOption(Object.fromEntries((data.answers || []).filter((answer) => answer.option_id).map((answer) => [answer.question_id, answer.option_id])))
       const lastMicrophoneWarning = (data.warnings || []).filter((warning) => warning.category === 'microphone_activity').at(-1)
       if (lastMicrophoneWarning) {
-        microphoneCooldownUntilRef.current = new Date(lastMicrophoneWarning.created_at).getTime() + MIC_COOLDOWN_MS
-        microphoneLatchedRef.current = Date.now() < microphoneCooldownUntilRef.current
+        microphoneDetectionRef.current.cooldownUntil = new Date(lastMicrophoneWarning.created_at).getTime() + MIC_COOLDOWN_MS
+        microphoneDetectionRef.current.latched = Date.now() < microphoneDetectionRef.current.cooldownUntil
       }
       if (!activeAttemptId) throw new Error('The server did not create an exam attempt.')
       setExamMessage('')

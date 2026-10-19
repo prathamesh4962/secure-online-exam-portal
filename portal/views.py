@@ -18,6 +18,9 @@ from .proctoring_service import analyze_frame
 MAX_EXAM_WARNINGS = 3
 COUNTED_WARNING_CATEGORIES = {
     Incident.CATEGORY_CAMERA_ERROR,
+    Incident.CATEGORY_FACE_MISSING,
+    Incident.CATEGORY_FACE_MOVEMENT,
+    Incident.CATEGORY_MULTIPLE_FACES,
     Incident.CATEGORY_TAB_SWITCH,
     Incident.CATEGORY_MICROPHONE_ACTIVITY,
 }

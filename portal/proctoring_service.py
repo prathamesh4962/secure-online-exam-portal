@@ -48,6 +48,7 @@ def analyze_frame(frame_data):
         if len(faces) == 0:
             return {
                 'face_detected': False,
+                'face_count': 0,
                 'face_confidence': 0,
                 'status': 'warning',
                 'detail': 'No face was detected in the frame.',
@@ -59,6 +60,7 @@ def analyze_frame(frame_data):
         confidence = max(0, min(100, round((area / total_area) * 120 + len(faces) * 10, 2)))
         return {
             'face_detected': True,
+            'face_count': len(faces),
             'face_confidence': confidence,
             'status': 'ok' if confidence >= 45 else 'warning',
             'detail': 'Face detected with acceptable confidence.' if confidence >= 45 else 'Face detected but confidence is low.',
