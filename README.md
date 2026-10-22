@@ -50,6 +50,14 @@ The Vite development server proxies `/api` requests to `http://localhost:8000`.
 
 Create the initial administrator through Django's `createsuperuser` command, then set that account's portal role to `admin` through the Django shell or Django admin. Public self-registration only creates student accounts; faculty and administrator accounts must be provisioned by an administrator.
 
+For local demos and browser testing, the portal seeds these default accounts automatically after migrations:
+
+- Student: `vedant` / `DemoPass123!`
+- Faculty: `faculty` / `FacultyPass123!`
+- Admin: `admin` / `AdminPass123!`
+
+These demo accounts are intended for local development only and should not be used in production.
+
 ## Deploying
 
 The frontend can be deployed to Vercel. Django must be deployed separately to a Python application host, backed by a persistent PostgreSQL database. Do not deploy the local SQLite database or `.env` file.
